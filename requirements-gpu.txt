@@ -1,0 +1,11 @@
+# PyTorch под CUDA 12.1 (подходит для драйверов с nvidia-smi CUDA Version 12.x, например 535.xx).
+# Установка в чистое venv:
+#   python3.10 -m venv .venv && . .venv/bin/activate
+#   pip install -U pip
+#   pip install numpy triton
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# Если уже стоит torch 2.x+cu130 при драйвере 12.x — замените на cu121/cu122, иначе torch.cuda.is_available() == False.
+
+numpy>=1.24
+triton>=3.1.0
