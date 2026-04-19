@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Сравнение X@W^T: W в bf16 (cuBLAS) vs W в int4 + Triton W4A16.
 Размеры W — как у Llama-3.2-1B-Instruct; M ∈ {128, 512, 2048}.
@@ -32,6 +31,7 @@ def layer_specs():
 
 def _sync():
     import torch
+
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -115,6 +115,12 @@ def run_benchmarks(
     full_sanity: bool,
     Ms: list[int],
     quant_backend: str,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_warps: int,
+    num_stages: int,
+    autotune_kernel: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     import torch
 
@@ -126,14 +132,42 @@ def run_benchmarks(
     meta = _collect_env_meta()
     rows: list[dict[str, Any]] = []
 
+    kernel_config: dict[str, Any] = {
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "BLOCK_K": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "autotune": autotune_kernel,
+    }
+
+    def int4_mm(x_: torch.Tensor, qw_: Any) -> torch.Tensor:
+        return w4a16_linear_bf16(
+            x_,
+            qw_,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            autotune=autotune_kernel,
+        )
+
     print("Llama-3.2-1B-Instruct: bf16 matmul vs int4 Triton W4A16")
     print(
-        f"  group_size={group_size}  warmup={warmup} iters={iters}  "
+        f"  group_size={group_size}  warmup={warmup}  iters={iters}  "
         f"Ms={Ms}  quant_backend={quant_backend}"
     )
-    print(f"  env: torch={meta['torch']} cuda_available={meta['cuda_available']}", end="")
+    print(
+        f"  kernel: BLOCK_M={block_m}  BLOCK_N={block_n}  BLOCK_K={block_k}  "
+        f"num_warps={num_warps}  num_stages={num_stages}  autotune={autotune_kernel}"
+    )
+    print(
+        f"  env: torch={meta['torch']}  cuda_available={meta['cuda_available']}",
+        end="",
+    )
     if meta.get("device_name"):
-        print(f" device={meta['device_name']}")
+        print(f"  device={meta['device_name']}")
     else:
         print()
 
@@ -158,14 +192,14 @@ def run_benchmarks(
             print(
                 f"\n=== {name}  W ({n_out}, {n_in})  "
                 f"bf16_bytes≈{fp_bytes}  int4+scales≈{q_bytes}  ratio≈{ratio:.2f}x  "
-                f"quant_time={t_quant:.3f}s backend={quant_backend} ==="
+                f"quant_time={t_quant:.3f}s  backend={quant_backend} ==="
             )
 
             for M in Ms:
                 x = torch.randn(M, n_in, device=device, dtype=torch.bfloat16)
 
                 _ = torch.matmul(x, W_bf16.T)
-                _ = w4a16_linear_bf16(x, qw)
+                _ = int4_mm(x, qw)
                 _sync()
 
                 if _should_run_sanity(
@@ -181,7 +215,7 @@ def run_benchmarks(
                     _sync()
                     t_ref = time.perf_counter() - t_ref0
 
-                    y4 = w4a16_linear_bf16(x, qw)
+                    y4 = int4_mm(x, qw)
                     diff = y_ref.to(torch.bfloat16).float() - y4.float()
                     err_mean = diff.abs().mean().item()
                     err_max = diff.abs().max().item()
@@ -195,7 +229,7 @@ def run_benchmarks(
                     return torch.matmul(x, W_bf16.T)
 
                 def run4():
-                    return w4a16_linear_bf16(x, qw)
+                    return int4_mm(x, qw)
 
                 t16 = bench_fn(run16, warmup=warmup, iters=iters)
                 t4 = bench_fn(run4, warmup=warmup, iters=iters)
@@ -213,6 +247,7 @@ def run_benchmarks(
                         "K_in": n_in,
                         "M": M,
                         "quant_backend": quant_backend,
+                        "kernel_config": dict(kernel_config),
                         "quant_time_ms": round(t_quant * 1000, 6),
                         "t_bf16_ms": round(t16 * 1000, 6),
                         "t_int4_ms": round(t4 * 1000, 6),
@@ -222,8 +257,6 @@ def run_benchmarks(
                         "weight_compression_ratio": round(ratio, 4),
                     }
                 )
-
-            del W_bf16, qw
 
     return rows, meta
 
@@ -239,6 +272,14 @@ def main():
     ap.add_argument("--Ms", type=int, nargs="+", default=[128, 512, 2048])
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--quant-backend", choices=["torch", "triton"], default="torch")
+
+    kg = ap.add_argument_group("Triton W4A16 kernel (ignored when --autotune-kernel)")
+    kg.add_argument("--block-m", type=int, default=64)
+    kg.add_argument("--block-n", type=int, default=64)
+    kg.add_argument("--block-k", type=int, default=128)
+    kg.add_argument("--num-warps", type=int, default=4)
+    kg.add_argument("--num-stages", type=int, default=3)
+    ap.add_argument("--autotune-kernel", action="store_true", help="Let Triton pick BLOCK_* and warps/stages.")
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
 
@@ -269,6 +310,12 @@ def main():
         full_sanity=args.full_sanity,
         Ms=args.Ms,
         quant_backend=args.quant_backend,
+        block_m=args.block_m,
+        block_n=args.block_n,
+        block_k=args.block_k,
+        num_warps=args.num_warps,
+        num_stages=args.num_stages,
+        autotune_kernel=args.autotune_kernel,
     )
 
     if args.out:
