@@ -1,8 +1,8 @@
 """
 FP16/BF16 -> symmetric int4 with per-group scales; pack 2 nibbles per uint8.
-Веса fp16: N*K*2 байт; packed uint8: N*(K//2) — в 4 раза меньше по сырым весам
-(без учёта scales).
+Raw packed weights use 4x less memory than fp16 weights before scale overhead.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -72,7 +72,7 @@ def _quantize_pack_row_kernel(
 
     tl.store(
         scales_ptr + row * scales_stride_m + g * scales_stride_g,
-        scale_safe.to(tl.float32),
+        scale_safe.to(tl.bfloat16),
     )
     tl.store(
         packed_ptr + row * packed_stride_m + pack_col * packed_stride_k,
@@ -94,7 +94,7 @@ def _quantize_triton(w: torch.Tensor, group_size: int) -> tuple[torch.Tensor, to
         w_c = w_c.to(torch.float16)
 
     packed = torch.empty((n_rows, k // 2), device=w.device, dtype=torch.uint8)
-    scales = torch.empty((n_rows, num_groups), device=w.device, dtype=torch.float32)
+    scales = torch.empty((n_rows, num_groups), device=w.device, dtype=torch.bfloat16)
 
     grid = (n_rows, num_groups)
     _quantize_pack_row_kernel[grid](
@@ -116,15 +116,13 @@ def _quantize_triton(w: torch.Tensor, group_size: int) -> tuple[torch.Tensor, to
 
 
 def _quantize_torch_reference(w: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Векторизованный torch-reference без Python-циклов по элементам.
-    """
+    """Vectorized torch reference without element-wise Python loops."""
     assert w.dim() == 2
     n_rows, k = w.shape
     assert k % 2 == 0
     assert group_size > 0 and group_size % 2 == 0
 
-    wf = w.float()
+    wf = w.to(torch.bfloat16).float()
     num_groups = (k + group_size - 1) // group_size
     padded_k = num_groups * group_size
     pad = padded_k - k
@@ -134,7 +132,7 @@ def _quantize_torch_reference(w: torch.Tensor, group_size: int) -> tuple[torch.T
     else:
         wf_pad = wf
 
-    wg = wf_pad.view(n_rows, num_groups, group_size)  # (N, G, GS)
+    wg = wf_pad.view(n_rows, num_groups, group_size)
 
     absmax = wg.abs().amax(dim=-1).clamp_min(1e-8)
     scales = absmax / 7.0
@@ -147,7 +145,7 @@ def _quantize_torch_reference(w: torch.Tensor, group_size: int) -> tuple[torch.T
     q_odd = q_off[:, 1::2]
 
     packed = ((q_even & 0xF) | ((q_odd & 0xF) << 4)).to(torch.uint8)
-    return packed.contiguous(), scales.contiguous()
+    return packed.contiguous(), scales.to(torch.bfloat16).contiguous()
 
 
 @dataclass
@@ -158,7 +156,7 @@ class QuantizedInt4Weight:
     orig_shape: tuple[int, int]
 
     def storage_bytes_weights_only(self) -> int:
-        return self.packed.numel() + self.scales.numel() * 4
+        return self.packed.numel() * self.packed.element_size() + self.scales.numel() * self.scales.element_size()
 
 
 def quantize_fp16_to_int4(
@@ -166,9 +164,7 @@ def quantize_fp16_to_int4(
     group_size: int = 128,
     prefer_triton: bool = False,
 ) -> QuantizedInt4Weight:
-    """
-    W: (N, K) как в nn.Linear: out_features × in_features.
-    """
+    """Quantize an nn.Linear-style weight matrix shaped as (out_features, in_features)."""
     assert w.dim() == 2
     orig = tuple(w.shape)
     wc = w.contiguous()

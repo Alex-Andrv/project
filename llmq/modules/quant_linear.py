@@ -2,16 +2,12 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-
 from llmq.kernels.int4_quantize import QuantizedInt4Weight, quantize_fp16_to_int4
 from llmq.kernels.w4a16_matmul import w4a16_linear_bf16
 
 
 class QuantLinearW4A16(nn.Module):
-    """
-    Простейший quantized linear layer.
-    Веса хранятся как int4+scales, bias опционально остаётся dense.
-    """
+    """Quantized linear layer with packed int4 weights and optional dense bias."""
 
     def __init__(
         self,
@@ -37,7 +33,7 @@ class QuantLinearW4A16(nn.Module):
         *,
         group_size: int = 128,
         prefer_triton_quant: bool = False,
-    ) -> "QuantLinearW4A16":
+    ) -> QuantLinearW4A16:
         qweight = quantize_fp16_to_int4(
             linear.weight.data,
             group_size=group_size,
@@ -68,3 +64,53 @@ class QuantLinearW4A16(nn.Module):
             y2d = y2d + self.bias.to(y2d.dtype)
 
         return y2d.reshape(*orig_shape[:-1], self.out_features)
+
+
+def replace_linear_with_w4a16(
+    module: nn.Module,
+    *,
+    group_size: int = 128,
+    prefer_triton_quant: bool = True,
+    prefix: str = "",
+) -> dict[str, int]:
+    """
+    Recursively replace eligible nn.Linear modules with QuantLinearW4A16.
+
+    Returns simple stats useful for benchmark logs.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("QuantLinearW4A16 requires CUDA tensors.")
+
+    stats = {"replaced": 0, "skipped": 0, "params_replaced": 0}
+
+    for child_name, child in list(module.named_children()):
+        full_name = f"{prefix}.{child_name}" if prefix else child_name
+        if isinstance(child, QuantLinearW4A16):
+            stats["skipped"] += 1
+            continue
+
+        if isinstance(child, nn.Linear):
+            if child_name == "lm_head" or child.in_features % 2 != 0:
+                stats["skipped"] += 1
+                continue
+
+            quant = QuantLinearW4A16.from_linear(
+                child,
+                group_size=group_size,
+                prefer_triton_quant=prefer_triton_quant,
+            )
+            setattr(module, child_name, quant)
+            stats["replaced"] += 1
+            stats["params_replaced"] += child.weight.numel()
+            continue
+
+        child_stats = replace_linear_with_w4a16(
+            child,
+            group_size=group_size,
+            prefer_triton_quant=prefer_triton_quant,
+            prefix=full_name,
+        )
+        for key, value in child_stats.items():
+            stats[key] += value
+
+    return stats
