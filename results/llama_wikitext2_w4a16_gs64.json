@@ -1,0 +1,64 @@
+{
+  "model": "unsloth/Llama-3.2-1B-Instruct",
+  "dataset": "wikitext-2-raw-v1",
+  "dataset_split": "test",
+  "seq_len": 1024,
+  "device": "cuda:0",
+  "torch": "2.11.0+cu128",
+  "cuda_device": "NVIDIA A40",
+  "results": [
+    {
+      "variant": "bf16",
+      "perplexity": {
+        "nll": 2.758152887225151,
+        "perplexity": 15.770685793076895,
+        "tokens": 32736.0
+      },
+      "forward": {
+        "seconds": 1.07519384765625,
+        "tokens": 32768.0,
+        "tokens_per_second": 30476.364863349045,
+        "batches": 8.0
+      },
+      "generation": {
+        "seconds": 2.02477001953125,
+        "new_tokens": 128.0,
+        "new_tokens_per_second": 63.21705614232326,
+        "prompt_tokens": 8.0,
+        "use_cache": true
+      }
+    },
+    {
+      "variant": "w4a16",
+      "perplexity": {
+        "nll": 2.9810534566640854,
+        "perplexity": 19.708567834728704,
+        "tokens": 32736.0
+      },
+      "forward": {
+        "seconds": 2.52097119140625,
+        "tokens": 32768.0,
+        "tokens_per_second": 12998.165195898702,
+        "batches": 8.0
+      },
+      "generation": {
+        "seconds": 3.1407216796875,
+        "new_tokens": 128.0,
+        "new_tokens_per_second": 40.754964321682884,
+        "prompt_tokens": 8.0,
+        "use_cache": true
+      }
+    }
+  ],
+  "quantization": {
+    "group_size": 64,
+    "quant_backend": "triton",
+    "skipped_linear": [
+      "lm_head"
+    ],
+    "seconds": 0.5632278330158442,
+    "replaced": 112,
+    "skipped": 1,
+    "params_replaced": 973078528
+  }
+}

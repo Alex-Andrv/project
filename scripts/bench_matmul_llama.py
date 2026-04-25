@@ -1,7 +1,5 @@
-"""
-Сравнение X@W^T: W в bf16 (cuBLAS) vs W в int4 + Triton W4A16.
-Размеры W — как у Llama-3.2-1B-Instruct; M ∈ {128, 512, 2048}.
-"""
+"""Benchmark Llama-3.2-1B linear shapes across BF16 and W4A16 paths."""
+
 from __future__ import annotations
 
 import argparse
@@ -9,27 +7,30 @@ import json
 import os
 import subprocess
 import sys
-import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 HIDDEN = 2048
 INTERMEDIATE = 8192
 NUM_KV_HEADS = 8
 HEAD_DIM = 64
-K_DIM = NUM_KV_HEADS * HEAD_DIM  # 512
+K_DIM = NUM_KV_HEADS * HEAD_DIM
 
 
-def layer_specs():
+def layer_specs() -> list[tuple[str, int, int]]:
     return [
         ("q_proj", HIDDEN, HIDDEN),
         ("k_proj", K_DIM, HIDDEN),
+        ("v_proj", K_DIM, HIDDEN),
+        ("o_proj", HIDDEN, HIDDEN),
         ("gate_proj", INTERMEDIATE, HIDDEN),
+        ("up_proj", INTERMEDIATE, HIDDEN),
         ("down_proj", HIDDEN, INTERMEDIATE),
     ]
 
 
-def _sync():
+def _sync() -> None:
     import torch
 
     if torch.cuda.is_available():
@@ -37,15 +38,42 @@ def _sync():
 
 
 def bench_fn(fn: Callable[[], object], warmup: int = 5, iters: int = 20) -> float:
+    import torch
+
     for _ in range(warmup):
         _ = fn()
     _sync()
 
-    t0 = time.perf_counter()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
     for _ in range(iters):
         _ = fn()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) / iters / 1000.0
+
+
+def bench_quantize_weight(fn: Callable[[], Any], warmup: int = 5, iters: int = 20) -> tuple[Any, float]:
+    import torch
+
+    last = None
+    for _ in range(warmup):
+        last = fn()
     _sync()
-    return (time.perf_counter() - t0) / iters
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        last = fn()
+    end.record()
+    end.synchronize()
+
+    if last is None:
+        last = fn()
+        _sync()
+    return last, start.elapsed_time(end) / iters / 1000.0
 
 
 def _nvidia_smi_cuda_version() -> str | None:
@@ -79,31 +107,272 @@ def _collect_env_meta() -> dict[str, Any]:
     return meta
 
 
-def _print_cuda_mismatch_hint():
-    print(
-        "\n--- Диагностика CUDA ---\n"
-        "PyTorch сообщает, что CUDA недоступна.\n",
-        file=sys.stderr,
-    )
+def _print_cuda_mismatch_hint() -> None:
+    print("\n--- CUDA diagnostics ---\nPyTorch reports that CUDA is unavailable.\n", file=sys.stderr)
     smi = _nvidia_smi_cuda_version()
     if smi:
         print(f"  nvidia-smi: {smi!r}\n", file=sys.stderr)
 
 
-def _should_run_sanity(
-    *,
-    sanity: bool,
-    full_sanity: bool,
-    layer_name: str,
-    M: int,
-    n_out: int,
-    n_in: int,
-) -> bool:
-    if not sanity:
-        return False
-    if full_sanity:
-        return M <= 512 and n_out <= 2048 and n_in <= 2048
-    return layer_name == "q_proj" and M == 128 and n_out <= 2048 and n_in <= 2048
+def _format_ms(seconds: float | None) -> str:
+    if seconds is None:
+        return "skipped"
+    return f"{seconds * 1000:8.3f}"
+
+
+def _print_result_table(entries: list[dict[str, Any]], baseline_ms: float | None) -> None:
+    print("    backend                         ms      speedup_vs_torch")
+    for entry in entries:
+        time_s = entry.get("time_s")
+        if time_s is None:
+            print(f"    {entry['backend']:<28} skipped  {entry.get('skip_reason', '')}")
+            continue
+        speedup = baseline_ms / (time_s * 1000) if baseline_ms and time_s > 0 else float("nan")
+        print(f"    {entry['backend']:<28} {_format_ms(time_s)}      {speedup:6.2f}x")
+
+
+def create_matmul_plots(payload: dict[str, Any], plots_dir: Path) -> list[Path]:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows = payload["rows"]
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    layers = [name for name, _, _ in layer_specs()]
+    group_sizes = sorted({row.get("group_size", 128) for row in rows})
+    primary_group_size = 128 if 128 in group_sizes else group_sizes[0]
+    plot_rows = [row for row in rows if row.get("group_size", 128) == primary_group_size]
+    ms_values = sorted({row["M"] for row in plot_rows})
+    backend_labels = {
+        "torch_bf16_linear": "torch bf16",
+        "torch_dequant_bf16_matmul": "torch dequant + bf16",
+        "triton_dequant_triton_bf16_matmul": "Triton dequant + Triton bf16",
+        "triton_w4a16_fused": "Triton W4A16",
+        "triton_bf16_matmul": "Triton bf16",
+    }
+    colors = {
+        "torch_bf16_linear": "tab:blue",
+        "torch_dequant_bf16_matmul": "tab:orange",
+        "triton_dequant_triton_bf16_matmul": "tab:purple",
+        "triton_w4a16_fused": "tab:green",
+        "triton_bf16_matmul": "tab:red",
+    }
+    outputs: list[Path] = []
+
+    for m_tokens in ms_values:
+        fig, ax = plt.subplots(figsize=(11, 5.5))
+        x = list(range(len(layers)))
+        width = min(0.8 / len(backend_labels), 0.18)
+        for idx, backend in enumerate(backend_labels):
+            values = [
+                next(
+                    row["time_ms"]
+                    for row in plot_rows
+                    if row["layer"] == layer and row["M"] == m_tokens and row["backend"] == backend
+                )
+                for layer in layers
+            ]
+            shift = (idx - (len(backend_labels) - 1) / 2) * width
+            ax.bar(
+                [pos + shift for pos in x],
+                values,
+                width=width,
+                label=backend_labels[backend],
+                color=colors[backend],
+            )
+        ax.set_title(f"Matmul latency, M={m_tokens}, group_size={primary_group_size}")
+        ax.set_ylabel("Latency, ms")
+        ax.set_xticks(x)
+        ax.set_xticklabels(layers, rotation=30, ha="right")
+        ax.grid(axis="y", alpha=0.3)
+        ax.legend(ncols=2)
+        fig.tight_layout()
+        path = plots_dir / f"matmul_latency_m{m_tokens}.png"
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        outputs.append(path)
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    x = list(range(len(layers)))
+    width = 0.24
+    for idx, m_tokens in enumerate(ms_values):
+        values = []
+        for layer in layers:
+            bf16 = next(
+                row["time_ms"]
+                for row in plot_rows
+                if row["layer"] == layer and row["M"] == m_tokens and row["backend"] == "torch_bf16_linear"
+            )
+            w4a16 = next(
+                row["time_ms"]
+                for row in plot_rows
+                if row["layer"] == layer and row["M"] == m_tokens and row["backend"] == "triton_w4a16_fused"
+            )
+            values.append(w4a16 / bf16)
+        shift = (idx - (len(ms_values) - 1) / 2) * width
+        ax.bar([pos + shift for pos in x], values, width=width, label=f"M={m_tokens}")
+    ax.axhline(1.0, color="black", linewidth=1)
+    ax.set_title(f"Triton W4A16 slowdown vs torch bf16, group_size={primary_group_size}")
+    ax.set_ylabel("Latency ratio")
+    ax.set_xticks(x)
+    ax.set_xticklabels(layers, rotation=30, ha="right")
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    path = plots_dir / "matmul_w4a16_slowdown.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    outputs.append(path)
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    x = list(range(len(layers)))
+    width = 0.24
+    for idx, m_tokens in enumerate(ms_values):
+        values = []
+        for layer in layers:
+            triton_bf16 = next(
+                row["time_ms"]
+                for row in plot_rows
+                if row["layer"] == layer and row["M"] == m_tokens and row["backend"] == "triton_bf16_matmul"
+            )
+            w4a16 = next(
+                row["time_ms"]
+                for row in plot_rows
+                if row["layer"] == layer and row["M"] == m_tokens and row["backend"] == "triton_w4a16_fused"
+            )
+            values.append(w4a16 / triton_bf16)
+        shift = (idx - (len(ms_values) - 1) / 2) * width
+        ax.bar([pos + shift for pos in x], values, width=width, label=f"M={m_tokens}")
+    ax.axhline(1.0, color="black", linewidth=1)
+    ax.set_title(f"Triton W4A16 slowdown vs Triton bf16, group_size={primary_group_size}")
+    ax.set_ylabel("Latency ratio")
+    ax.set_xticks(x)
+    ax.set_xticklabels(layers, rotation=30, ha="right")
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    path = plots_dir / "matmul_w4a16_vs_triton_bf16_slowdown.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    outputs.append(path)
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    x = list(range(len(layers)))
+    width = 0.24
+    for idx, m_tokens in enumerate(ms_values):
+        values = []
+        for layer in layers:
+            dequant_triton = next(
+                row["time_ms"]
+                for row in plot_rows
+                if row["layer"] == layer
+                and row["M"] == m_tokens
+                and row["backend"] == "triton_dequant_triton_bf16_matmul"
+            )
+            w4a16 = next(
+                row["time_ms"]
+                for row in plot_rows
+                if row["layer"] == layer and row["M"] == m_tokens and row["backend"] == "triton_w4a16_fused"
+            )
+            values.append(w4a16 / dequant_triton)
+        shift = (idx - (len(ms_values) - 1) / 2) * width
+        ax.bar([pos + shift for pos in x], values, width=width, label=f"M={m_tokens}")
+    ax.axhline(1.0, color="black", linewidth=1)
+    ax.set_title(f"Triton W4A16 vs separate Triton dequant + Triton bf16, group_size={primary_group_size}")
+    ax.set_ylabel("Latency ratio")
+    ax.set_xticks(x)
+    ax.set_xticklabels(layers, rotation=30, ha="right")
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    path = plots_dir / "matmul_w4a16_vs_triton_dequant_bf16_slowdown.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    outputs.append(path)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    x = list(range(len(layers)))
+    bf16_mib = []
+    int4_mib = []
+    for layer in layers:
+        row = next(
+            row
+            for row in plot_rows
+            if row["layer"] == layer and row["M"] == ms_values[0] and row["backend"] == "torch_bf16_linear"
+        )
+        bf16_mib.append(row["weight_bf16_bytes"] / 2**20)
+        int4_mib.append(row["weight_int4_bytes"] / 2**20)
+    ax.bar([pos - 0.18 for pos in x], bf16_mib, width=0.36, label="bf16")
+    ax.bar([pos + 0.18 for pos in x], int4_mib, width=0.36, label="int4 + scales")
+    ax.set_title("Weight storage by layer")
+    ax.set_ylabel("MiB")
+    ax.set_xticks(x)
+    ax.set_xticklabels(layers, rotation=30, ha="right")
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    path = plots_dir / "matmul_weight_storage.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    outputs.append(path)
+
+    if len(group_sizes) > 1:
+        fig, ax = plt.subplots(figsize=(8, 4.8))
+        avg_slowdowns = []
+        avg_compressions = []
+        for group_size in group_sizes:
+            slowdowns = []
+            compressions = []
+            for layer in layers:
+                for m_tokens in ms_values:
+                    bf16 = next(
+                        row["time_ms"]
+                        for row in rows
+                        if row.get("group_size", 128) == group_size
+                        and row["layer"] == layer
+                        and row["M"] == m_tokens
+                        and row["backend"] == "torch_bf16_linear"
+                    )
+                    w4a16 = next(
+                        row["time_ms"]
+                        for row in rows
+                        if row.get("group_size", 128) == group_size
+                        and row["layer"] == layer
+                        and row["M"] == m_tokens
+                        and row["backend"] == "triton_w4a16_fused"
+                    )
+                    slowdowns.append(w4a16 / bf16)
+                compression = next(
+                    row["weight_compression_ratio"]
+                    for row in rows
+                    if row.get("group_size", 128) == group_size
+                    and row["layer"] == layer
+                    and row["M"] == ms_values[0]
+                    and row["backend"] == "torch_bf16_linear"
+                )
+                compressions.append(compression)
+            avg_slowdowns.append(sum(slowdowns) / len(slowdowns))
+            avg_compressions.append(sum(compressions) / len(compressions))
+        labels = [str(group_size) for group_size in group_sizes]
+        x = list(range(len(group_sizes)))
+        ax.bar([pos - 0.18 for pos in x], avg_slowdowns, width=0.36, label="Avg W4A16 slowdown")
+        ax.bar([pos + 0.18 for pos in x], avg_compressions, width=0.36, label="Avg compression")
+        ax.axhline(1.0, color="black", linewidth=1)
+        ax.set_title("Group size tuning summary")
+        ax.set_ylabel("Ratio")
+        ax.set_xlabel("group_size")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+        ax.grid(axis="y", alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        path = plots_dir / "matmul_group_size_tuning.png"
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        outputs.append(path)
+
+    return outputs
 
 
 def run_benchmarks(
@@ -111,220 +380,178 @@ def run_benchmarks(
     warmup: int,
     iters: int,
     group_size: int,
-    sanity: bool,
-    full_sanity: bool,
     Ms: list[int],
-    quant_backend: str,
-    block_m: int,
-    block_n: int,
-    block_k: int,
-    num_warps: int,
-    num_stages: int,
-    autotune_kernel: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     import torch
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from llmq.kernels.bf16_matmul import bf16_linear_triton
     from llmq.kernels.int4_quantize import quantize_fp16_to_int4
-    from llmq.kernels.w4a16_matmul import w4a16_linear_bf16, w4a16_matmul_reference
+    from llmq.kernels.w4a16_matmul import (
+        dequantize_int4_weight_torch,
+        dequantize_int4_weight_triton,
+        w4a16_linear_bf16,
+    )
 
     device = torch.device("cuda")
     meta = _collect_env_meta()
     rows: list[dict[str, Any]] = []
 
-    kernel_config: dict[str, Any] = {
-        "BLOCK_M": block_m,
-        "BLOCK_N": block_n,
-        "BLOCK_K": block_k,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "autotune": autotune_kernel,
-    }
-
-    def int4_mm(x_: torch.Tensor, qw_: Any) -> torch.Tensor:
-        return w4a16_linear_bf16(
-            x_,
-            qw_,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            BLOCK_K=block_k,
-            num_warps=num_warps,
-            num_stages=num_stages,
-            autotune=autotune_kernel,
-        )
-
-    print("Llama-3.2-1B-Instruct: bf16 matmul vs int4 Triton W4A16")
-    print(
-        f"  group_size={group_size}  warmup={warmup}  iters={iters}  "
-        f"Ms={Ms}  quant_backend={quant_backend}"
-    )
-    print(
-        f"  kernel: BLOCK_M={block_m}  BLOCK_N={block_n}  BLOCK_K={block_k}  "
-        f"num_warps={num_warps}  num_stages={num_stages}  autotune={autotune_kernel}"
-    )
-    print(
-        f"  env: torch={meta['torch']}  cuda_available={meta['cuda_available']}",
-        end="",
-    )
-    if meta.get("device_name"):
-        print(f"  device={meta['device_name']}")
-    else:
-        print()
+    print("Llama-3.2-1B-Instruct linear benchmark")
+    print(f"  group_size={group_size}  warmup={warmup}  iters={iters}  Ms={Ms}  quant_backend=triton")
+    print(f"  env: torch={meta['torch']}  cuda_available={meta['cuda_available']}", end="")
+    print(f"  device={meta.get('device_name', 'unknown')}")
 
     with torch.inference_mode():
+        warmup_w = torch.zeros((1, group_size), device=device, dtype=torch.bfloat16)
+        _ = quantize_fp16_to_int4(warmup_w, group_size=group_size, prefer_triton=True)
+        _sync()
+
         for name, n_out, n_in in layer_specs():
-            W_bf16 = torch.randn(n_out, n_in, device=device, dtype=torch.bfloat16) * 0.02
+            w_bf16 = (torch.randn(n_out, n_in, device=device, dtype=torch.bfloat16) * 0.02).contiguous()
 
-            tq0 = time.perf_counter()
-            qw = quantize_fp16_to_int4(
-                W_bf16,
-                group_size=group_size,
-                prefer_triton=(quant_backend == "triton"),
+            qw, t_quant = bench_quantize_weight(
+                lambda w_bf16=w_bf16: quantize_fp16_to_int4(
+                    w_bf16,
+                    group_size=group_size,
+                    prefer_triton=True,
+                ),
+                warmup=warmup,
+                iters=iters,
             )
-            _sync()
-            t_quant = time.perf_counter() - tq0
 
-            n_el = n_out * n_in
-            fp_bytes = n_el * 2
-            q_bytes = qw.packed.numel() + qw.scales.numel() * 4
+            fp_bytes = w_bf16.numel() * w_bf16.element_size()
+            q_bytes = qw.storage_bytes_weights_only()
             ratio = fp_bytes / q_bytes
 
             print(
-                f"\n=== {name}  W ({n_out}, {n_in})  "
-                f"bf16_bytes≈{fp_bytes}  int4+scales≈{q_bytes}  ratio≈{ratio:.2f}x  "
-                f"quant_time={t_quant:.3f}s  backend={quant_backend} ==="
+                f"\n=== {name}  W=({n_out}, {n_in})  "
+                f"bf16={fp_bytes / 2**20:.2f} MiB  int4+scales={q_bytes / 2**20:.2f} MiB  "
+                f"ratio={ratio:.2f}x  quant={t_quant * 1000:.2f} ms ==="
             )
 
-            for M in Ms:
-                x = torch.randn(M, n_in, device=device, dtype=torch.bfloat16)
+            for m_tokens in Ms:
+                x = torch.randn(m_tokens, n_in, device=device, dtype=torch.bfloat16).contiguous()
 
-                _ = torch.matmul(x, W_bf16.T)
-                _ = int4_mm(x, qw)
-                _sync()
+                backends: list[tuple[str, Callable[[], torch.Tensor] | None, str | None]] = [
+                    ("torch_bf16_linear", lambda x=x, w_bf16=w_bf16: torch.matmul(x, w_bf16.T), None),
+                    (
+                        "torch_dequant_bf16_matmul",
+                        lambda x=x, qw=qw: torch.matmul(
+                            x,
+                            dequantize_int4_weight_torch(qw, dtype=torch.bfloat16).T,
+                        ),
+                        None,
+                    ),
+                    (
+                        "triton_dequant_triton_bf16_matmul",
+                        lambda x=x, qw=qw: bf16_linear_triton(
+                            x,
+                            dequantize_int4_weight_triton(qw),
+                        ),
+                        None,
+                    ),
+                    ("triton_w4a16_fused", lambda x=x, qw=qw: w4a16_linear_bf16(x, qw), None),
+                    ("triton_bf16_matmul", lambda x=x, w_bf16=w_bf16: bf16_linear_triton(x, w_bf16), None),
+                ]
 
-                if _should_run_sanity(
-                    sanity=sanity,
-                    full_sanity=full_sanity,
-                    layer_name=name,
-                    M=M,
-                    n_out=n_out,
-                    n_in=n_in,
-                ):
-                    t_ref0 = time.perf_counter()
-                    y_ref = w4a16_matmul_reference(x, qw)
-                    _sync()
-                    t_ref = time.perf_counter() - t_ref0
+                entries: list[dict[str, Any]] = []
+                baseline_ms: float | None = None
+                for backend, fn, skip_reason in backends:
+                    if fn is None:
+                        entry = {"backend": backend, "time_s": None, "skip_reason": skip_reason}
+                    else:
+                        try:
+                            time_s = bench_fn(fn, warmup=warmup, iters=iters)
+                        except Exception as exc:
+                            entry = {"backend": backend, "time_s": None, "skip_reason": f"{type(exc).__name__}: {exc}"}
+                        else:
+                            entry = {"backend": backend, "time_s": time_s, "skip_reason": None}
+                            if backend == "torch_bf16_linear":
+                                baseline_ms = time_s * 1000
+                    entries.append(entry)
 
-                    y4 = int4_mm(x, qw)
-                    diff = y_ref.to(torch.bfloat16).float() - y4.float()
-                    err_mean = diff.abs().mean().item()
-                    err_max = diff.abs().max().item()
+                print(f"  M={m_tokens}")
+                _print_result_table(entries, baseline_ms)
 
-                    print(
-                        f"  M={M}: mean |ref-ker| = {err_mean:.6f}, "
-                        f"max = {err_max:.6f} (sanity, ref_time={t_ref:.3f}s)"
+                for entry in entries:
+                    rows.append(
+                        {
+                            "layer": name,
+                            "N": n_out,
+                            "K_in": n_in,
+                            "M": m_tokens,
+                            "backend": entry["backend"],
+                            "group_size": group_size,
+                            "time_ms": None if entry["time_s"] is None else round(entry["time_s"] * 1000, 6),
+                            "skip_reason": entry.get("skip_reason"),
+                            "quant_backend": "triton",
+                            "quant_time_ms": round(t_quant * 1000, 6),
+                            "weight_bf16_bytes": fp_bytes,
+                            "weight_int4_bytes": q_bytes,
+                            "weight_compression_ratio": round(ratio, 4),
+                        }
                     )
-
-                def run16():
-                    return torch.matmul(x, W_bf16.T)
-
-                def run4():
-                    return int4_mm(x, qw)
-
-                t16 = bench_fn(run16, warmup=warmup, iters=iters)
-                t4 = bench_fn(run4, warmup=warmup, iters=iters)
-                sp = t16 / t4 if t4 > 0 else float("inf")
-
-                print(
-                    f"  M={M:4d}  bf16: {t16 * 1000:.3f} ms   "
-                    f"int4: {t4 * 1000:.3f} ms   speedup {sp:.2f}x"
-                )
-
-                rows.append(
-                    {
-                        "layer": name,
-                        "N": n_out,
-                        "K_in": n_in,
-                        "M": M,
-                        "quant_backend": quant_backend,
-                        "kernel_config": dict(kernel_config),
-                        "quant_time_ms": round(t_quant * 1000, 6),
-                        "t_bf16_ms": round(t16 * 1000, 6),
-                        "t_int4_ms": round(t4 * 1000, 6),
-                        "speedup_bf16_over_int4": round(sp, 4),
-                        "weight_bf16_bytes": fp_bytes,
-                        "weight_int4_bytes": q_bytes,
-                        "weight_compression_ratio": round(ratio, 4),
-                    }
-                )
 
     return rows, meta
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Benchmark bf16 vs int4 matmul (Llama-1B shapes).")
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Benchmark BF16 and W4A16 matmul on Llama-1B linear shapes.")
     ap.add_argument("--gpu", type=int, default=None)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--group-size", type=int, default=128)
-    ap.add_argument("--no-sanity", action="store_true")
-    ap.add_argument("--full-sanity", action="store_true")
+    ap.add_argument("--group-sizes", type=int, nargs="+", default=None)
     ap.add_argument("--Ms", type=int, nargs="+", default=[128, 512, 2048])
-    ap.add_argument("--fast", action="store_true")
-    ap.add_argument("--quant-backend", choices=["torch", "triton"], default="torch")
-
-    kg = ap.add_argument_group("Triton W4A16 kernel (ignored when --autotune-kernel)")
-    kg.add_argument("--block-m", type=int, default=64)
-    kg.add_argument("--block-n", type=int, default=64)
-    kg.add_argument("--block-k", type=int, default=128)
-    kg.add_argument("--num-warps", type=int, default=4)
-    kg.add_argument("--num-stages", type=int, default=3)
-    ap.add_argument("--autotune-kernel", action="store_true", help="Let Triton pick BLOCK_* and warps/stages.")
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--plots-dir", type=Path, default=None)
     args = ap.parse_args()
 
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
-    if args.fast:
-        args.warmup = min(args.warmup, 2)
-        args.iters = min(args.iters, 5)
-        args.Ms = [m for m in args.Ms if m in (128, 512)] or [128, 512]
-
     try:
         import torch
     except ImportError:
-        print("Установите зависимости: pip install -r requirements.txt", file=sys.stderr)
+        print('Install dependencies with: pip install -e ".[dev]"', file=sys.stderr)
         sys.exit(1)
 
     if not torch.cuda.is_available():
         _print_cuda_mismatch_hint()
-        print("CUDA недоступна — замеры на GPU невозможны.", file=sys.stderr)
+        print("CUDA is unavailable; GPU benchmarks cannot run.", file=sys.stderr)
         sys.exit(2)
 
-    rows, meta = run_benchmarks(
-        warmup=args.warmup,
-        iters=args.iters,
-        group_size=args.group_size,
-        sanity=not args.no_sanity,
-        full_sanity=args.full_sanity,
-        Ms=args.Ms,
-        quant_backend=args.quant_backend,
-        block_m=args.block_m,
-        block_n=args.block_n,
-        block_k=args.block_k,
-        num_warps=args.num_warps,
-        num_stages=args.num_stages,
-        autotune_kernel=args.autotune_kernel,
-    )
+    group_sizes = args.group_sizes or [args.group_size]
+    rows: list[dict[str, Any]] = []
+    meta: dict[str, Any] | None = None
+    for group_size in group_sizes:
+        group_rows, group_meta = run_benchmarks(
+            warmup=args.warmup,
+            iters=args.iters,
+            group_size=group_size,
+            Ms=args.Ms,
+        )
+        rows.extend(group_rows)
+        meta = group_meta
+    assert meta is not None
+
+    payload = {"meta": meta, "group_sizes": group_sizes, "rows": rows}
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"meta": meta, "rows": rows}
         args.out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"\nJSON: {args.out}")
 
-    print("\nГотово.")
+    plots_dir = args.plots_dir
+    if plots_dir is None and args.out is not None:
+        plots_dir = args.out.parent / "plots"
+    if plots_dir is not None:
+        plots = create_matmul_plots(payload, plots_dir)
+        for path in plots:
+            print(f"Plot: {path}")
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":
